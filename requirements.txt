@@ -1,0 +1,16 @@
+langchain
+langchain-community
+langchain-ollama
+langchain-core
+sentence-transformers
+faiss-cpu
+streamlit
+transformers
+PyMuPDF
+python-docx
+beautifulsoup4
+readability-lxml
+requests
+lxml
+rank_bm25
+python-dotenv
