@@ -1,35 +1,6 @@
 version: '3.8'
 
 services:
-  ollama-cpu:
-    image: ollama/ollama:latest
-    container_name: ollama_db_cpu
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-    profiles:
-      - cpu
-
-  ollama-gpu:
-    image: ollama/ollama:latest
-    container_name: ollama_db_gpu
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    profiles:
-      - gpu
-
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant_db
@@ -49,7 +20,7 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - OLLAMA_HOST=http://ollama-cpu:11434
+      - OLLAMA_HOST=http://host.docker.internal:11434
       - QDRANT_URL=http://qdrant:6333
     volumes:
       - ./data:/app/data
@@ -58,7 +29,6 @@ services:
       - hf_cache:/root/.cache/huggingface
       - fastembed_cache:/root/.cache/fastembed
     depends_on:
-      - ollama-cpu
       - qdrant
     restart: unless-stopped
     profiles:
@@ -73,7 +43,7 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - OLLAMA_HOST=http://ollama-gpu:11434
+      - OLLAMA_HOST=http://host.docker.internal:11434
       - QDRANT_URL=http://qdrant:6333
     volumes:
       - ./data:/app/data
@@ -82,7 +52,6 @@ services:
       - hf_cache:/root/.cache/huggingface
       - fastembed_cache:/root/.cache/fastembed
     depends_on:
-      - ollama-gpu
       - qdrant
     restart: unless-stopped
     deploy:
@@ -96,7 +65,6 @@ services:
       - gpu
 
 volumes:
-  ollama_data:
   qdrant_data:
   hf_cache:
   fastembed_cache:
