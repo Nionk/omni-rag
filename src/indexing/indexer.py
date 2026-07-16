@@ -2,6 +2,7 @@ from src.core.logger import setup_logger
 from src.core.config import QDRANT_URL, QDRANT_COLLECTION, DB_DIR
 import os
 import re
+import uuid
 from typing import List, Dict, Any, Optional
 import torch
 
@@ -80,7 +81,35 @@ class VectorIndexer:
                 doc = Document(page_content=text, metadata=metadata)
                 chunks = self.splitter.split_documents([doc])
                 
-                for chunk in chunks:
+                chunk_ids = [
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, f"omni-rag:{doc_id}:{index}"))
+                    for index in range(len(chunks))
+                ]
+
+                for index, chunk in enumerate(chunks):
+                    graph_edges = []
+                    if index > 0:
+                        graph_edges.append(
+                            {"target_id": chunk_ids[index - 1], "relation": "previous_chunk"}
+                        )
+                    if index + 1 < len(chunks):
+                        graph_edges.append(
+                            {"target_id": chunk_ids[index + 1], "relation": "next_chunk"}
+                        )
+
+                    chunk.metadata.update(
+                        {
+                            "chunk_id": chunk_ids[index],
+                            "chunk_index": index,
+                            "chunk_count": len(chunks),
+                            "node_type": "chunk",
+                            "prev_chunk_id": chunk_ids[index - 1] if index > 0 else None,
+                            "next_chunk_id": (
+                                chunk_ids[index + 1] if index + 1 < len(chunks) else None
+                            ),
+                            "graph_edges": graph_edges,
+                        }
+                    )
                     chunk.page_content = f"[Источник: {filename}]\n{chunk.page_content}"
                     langchain_docs.append(chunk)
 
@@ -111,7 +140,10 @@ class VectorIndexer:
                 retrieval_mode=RetrievalMode.HYBRID
             )
 
-            vector_store.add_documents(langchain_docs)
+            vector_store.add_documents(
+                langchain_docs,
+                ids=[chunk.metadata["chunk_id"] for chunk in langchain_docs],
+            )
             
             logger.info("Чанки успешно добавлены в Qdrant.")
             

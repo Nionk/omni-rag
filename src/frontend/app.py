@@ -2,10 +2,9 @@ import streamlit as st
 import os
 import time
 import torch
-import re
 import tempfile
+import uuid
 
-from langchain_ollama import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -16,10 +15,21 @@ try:
 except ImportError:
     QdrantVectorStore = None
 
-from src.core.config import EMBEDDING_MODEL, OLLAMA_HOST, DATA_DIR, QDRANT_URL, QDRANT_COLLECTION, DB_DIR
+from src.core.config import (
+    DB_DIR,
+    EMBEDDING_MODEL,
+    GRAPH_TRAVERSAL_DEPTH,
+    GRAPH_TRAVERSAL_ENABLED,
+    GRAPH_TRAVERSAL_MAX_NODES,
+    MEMORY_ENABLED,
+    QDRANT_COLLECTION,
+    QDRANT_GRAPH_COLLECTION,
+    QDRANT_URL,
+)
 from src.core.rag import build_rag_chain
-from src.cli.ingest import run_pipeline
+from src.graph.traversal import GraphTraversalRetriever, QdrantGraphTraverser
 from src.indexing.router import DocumentRouter
+from src.memory import ConversationMemoryStore, DialogueSummarizer
 
 # 3.1 Caching
 from langchain_core.globals import set_llm_cache
@@ -66,6 +76,43 @@ def load_db():
     except Exception as e:
         return None, f"Критическая ошибка инициализации: {e}"
 
+@st.cache_resource(show_spinner=False)
+def load_graph_traverser():
+    if not GRAPH_TRAVERSAL_ENABLED:
+        return None
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        if not client.collection_exists(QDRANT_GRAPH_COLLECTION):
+            return None
+    except Exception as graph_error:
+        print(f"Graph traversal initialization failed: {graph_error}")
+        return None
+    return QdrantGraphTraverser(
+        client=client,
+        collection_name=QDRANT_GRAPH_COLLECTION,
+        max_depth=GRAPH_TRAVERSAL_DEPTH,
+        max_nodes=GRAPH_TRAVERSAL_MAX_NODES,
+    )
+
+@st.cache_resource(show_spinner=False)
+def load_memory_store():
+    if not MEMORY_ENABLED:
+        return None
+    return ConversationMemoryStore()
+
+def build_memory_context(summary, messages):
+    if summary:
+        return f"Краткое summary предыдущего диалога: {summary}"
+
+    recent_messages = messages[:-1][-2:]
+    if not recent_messages:
+        return "История отсутствует."
+    return "\n".join(
+        f"{'Пользователь' if message['role'] == 'user' else 'Ассистент'}: "
+        f"{message['content']}"
+        for message in recent_messages
+    )
+
 def process_temp_files(uploaded_files):
     """Обработка временных файлов для InMemory VectorStore"""
     if "temp_vectorstore" not in st.session_state:
@@ -109,15 +156,58 @@ if not main_retriever:
     st.error(status_msg)
     st.stop()
 
+graph_traverser = load_graph_traverser()
+memory_store = load_memory_store()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+default_user_id = os.getenv("DEFAULT_USER_ID", "local-user")
+user_id = st.sidebar.text_input(
+    "Идентификатор пользователя",
+    value=default_user_id,
+    help="По нему PostgreSQL восстанавливает последнее summary при новом входе.",
+).strip() or default_user_id
+
+if st.session_state.get("memory_user_id") != user_id:
+    st.session_state.memory_user_id = user_id
+    st.session_state.conversation_session_id = str(uuid.uuid4())
+    st.session_state.messages = []
+    st.session_state.memory_summary = ""
+    st.session_state.memory_source = ""
+    if memory_store:
+        memory_record = memory_store.load_summary(
+            user_id, st.session_state.conversation_session_id
+        )
+        if memory_record:
+            st.session_state.memory_summary = memory_record.summary
+            st.session_state.memory_source = memory_record.source
+
+if memory_store:
+    source_label = {
+        "redis": "Redis (активный сеанс)",
+        "postgres": "PostgreSQL (архив)",
+    }.get(st.session_state.get("memory_source"), "новый диалог")
+    st.sidebar.caption(f"Память: {source_label}")
+    if st.session_state.get("memory_summary"):
+        with st.sidebar.expander("Текущее summary"):
+            st.write(st.session_state.memory_summary)
+    if st.sidebar.button("Завершить сеанс", use_container_width=True):
+        memory_store.end_session(st.session_state.conversation_session_id)
+        st.session_state.messages = []
+        st.session_state.memory_summary = ""
+        st.session_state.memory_source = ""
+        st.session_state.conversation_session_id = str(uuid.uuid4())
+        st.rerun()
+else:
+    st.sidebar.caption("Память отключена")
+
 # 3.2 Временные файлы для чата
 with st.expander("Прикрепить временный файл"):
     temp_files = st.file_uploader("Файлы только для текущего сеанса", accept_multiple_files=True, key="temp_uploader")
     if temp_files:
         process_temp_files(temp_files)
         st.success(f"Загружено файлов: {len(st.session_state.temp_files_names)}. Они будут автоматически учтены при ответе.")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
 for msg_idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
@@ -147,23 +237,19 @@ if prompt := st.chat_input("Например: Какие побочные эфф
                 else:
                     active_retriever = main_retriever
 
-                # Debug print to console
-                print(f"--- DEBUG: USER PROMPT: {prompt} ---")
-                retrieved_docs = active_retriever.invoke(prompt)
-                print(f"--- DEBUG: RETRIEVED DOCS ({len(retrieved_docs)}) ---")
-                for d in retrieved_docs:
-                    print(d.page_content[:200])
+                if graph_traverser:
+                    active_retriever = GraphTraversalRetriever(
+                        base_retriever=active_retriever,
+                        traverser=graph_traverser,
+                    )
 
                 # Собираем chain на лету с активным ретривером
-                rag_chain, _ = build_rag_chain(active_retriever, top_k)
+                rag_chain, llm = build_rag_chain(active_retriever, top_k)
 
-                chat_history = []
-                # Ограничиваем историю только последними 2 сообщениями (1 пара вопрос-ответ)
-                for msg in st.session_state.messages[-3:-1]: 
-                    if msg["role"] == "user":
-                        chat_history.append(("human", msg["content"]))
-                    else:
-                        chat_history.append(("ai", msg["content"]))
+                chat_history = build_memory_context(
+                    st.session_state.get("memory_summary", ""),
+                    st.session_state.messages,
+                )
                         
                 last_update_time = time.time()
                 UPDATE_INTERVAL = 0.1
@@ -181,6 +267,24 @@ if prompt := st.chat_input("Например: Какие побочные эфф
                     "role": "assistant", 
                     "content": full_response
                 })
+
+                if memory_store:
+                    try:
+                        updated_summary = DialogueSummarizer(llm).summarize(
+                            st.session_state.get("memory_summary", ""),
+                            prompt,
+                            full_response,
+                        )
+                        st.session_state.memory_summary = updated_summary
+                        memory_source = memory_store.save_summary(
+                            user_id,
+                            st.session_state.conversation_session_id,
+                            updated_summary,
+                        )
+                        if memory_source:
+                            st.session_state.memory_source = memory_source
+                    except Exception as memory_error:
+                        print(f"Memory summary update failed: {memory_error}")
                 st.rerun()
                 
             except Exception as e:

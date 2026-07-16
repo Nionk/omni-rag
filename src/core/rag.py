@@ -1,7 +1,6 @@
 from langchain_ollama import ChatOllama
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
@@ -23,7 +22,8 @@ def build_rag_chain(base_retriever, top_k=4):
         "Если в тексте нет ответа, напиши 'В базе данных нет информации по этому вопросу'. "
         "Категорически запрещено выдумывать факты или использовать свои знания.\n\n"
         "ТЕКСТ:\n{context}\n\n"
-        "ИСТОРИЯ ДИАЛОГА:\n{chat_history}\n\n"
+        "ИСТОРИЯ ДИАЛОГА (используй только для понимания контекста вопроса, "
+        "но не как источник медицинских фактов):\n{chat_history}\n\n"
         "ВОПРОС: {input}\n\n"
         "ОТВЕТ:"
     )

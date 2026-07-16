@@ -19,7 +19,28 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 # Настройки Qdrant
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "omni_rag_collection")
+QDRANT_GRAPH_COLLECTION = os.getenv("QDRANT_GRAPH_COLLECTION", QDRANT_COLLECTION)
+
+# Настройки обхода графа. Qdrant хранит узлы и ребра в payload, а обход
+# выполняется приложением, поскольку сама база не является графовой СУБД.
+GRAPH_TRAVERSAL_ENABLED = os.getenv("GRAPH_TRAVERSAL_ENABLED", "true").lower() in {
+    "1", "true", "yes", "on"
+}
+GRAPH_TRAVERSAL_DEPTH = int(os.getenv("GRAPH_TRAVERSAL_DEPTH", "1"))
+GRAPH_TRAVERSAL_MAX_NODES = int(os.getenv("GRAPH_TRAVERSAL_MAX_NODES", "6"))
+
+# Горячая и холодная память диалогов
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+POSTGRES_DSN = os.getenv(
+    "POSTGRES_DSN",
+    "postgresql://omni_rag:omni_rag_local@localhost:5432/omni_rag",
+)
+SESSION_MEMORY_TTL_SECONDS = int(os.getenv("SESSION_MEMORY_TTL_SECONDS", "1800"))
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Настройки парсинга и векторизации
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 50 * 1024 * 1024))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+INDEX_SCHEMA_VERSION = int(os.getenv("INDEX_SCHEMA_VERSION", "2"))

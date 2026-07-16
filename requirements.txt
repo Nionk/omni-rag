@@ -17,3 +17,5 @@ readability-lxml
 requests
 lxml
 python-dotenv
+redis>=5,<7
+psycopg[binary]>=3.2,<4

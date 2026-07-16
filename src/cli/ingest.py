@@ -7,7 +7,16 @@ import concurrent.futures
 
 from src.indexing.router import DocumentRouter
 from src.indexing.indexer import VectorIndexer
-from src.core.config import DATA_DIR, DB_DIR, STATE_FILE, DLQ_FILE, EMBEDDING_MODEL
+from src.core.config import (
+    DATA_DIR,
+    DB_DIR,
+    DLQ_FILE,
+    EMBEDDING_MODEL,
+    INDEX_SCHEMA_VERSION,
+    QDRANT_COLLECTION,
+    QDRANT_URL,
+    STATE_FILE,
+)
 from src.core.logger import setup_logger
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
@@ -40,6 +49,34 @@ def save_json(filepath: Path, data: dict):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
+def delete_qdrant_documents(doc_ids: list[str]) -> bool:
+    """Удаляет все чанки документов по их метаданным."""
+    if not doc_ids:
+        return True
+
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models
+
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        if client.collection_exists(QDRANT_COLLECTION):
+            client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.doc_id",
+                            match=models.MatchAny(any=doc_ids),
+                        )
+                    ]
+                ),
+                wait=True,
+            )
+        return True
+    except Exception as exc:
+        logger.error(f"Ошибка при удалении документов из Qdrant: {exc}")
+        return False
+
 def garbage_collection(state: dict) -> dict:
     """
     Удаляет из базы Qdrant и doc_store документы, которых больше нет на диске в папке data/.
@@ -58,28 +95,9 @@ def garbage_collection(state: dict) -> dict:
             deleted_keys.append(filepath_str)
 
     if ids_to_delete:
-        from qdrant_client import QdrantClient
-        from qdrant_client.http import models
-        from src.core.config import QDRANT_URL, QDRANT_COLLECTION, DB_DIR
-        try:
-            # 1. Удаление чанков из Qdrant по метаданным
-            client = QdrantClient(url=QDRANT_URL)
-            if client.collection_exists(QDRANT_COLLECTION):
-                client.delete(
-                    collection_name=QDRANT_COLLECTION,
-                    points_selector=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="metadata.doc_id",
-                                match=models.MatchAny(any=ids_to_delete)
-                            )
-                        ]
-                    )
-                )
-            
+        if delete_qdrant_documents(ids_to_delete):
             logger.info(f"Успешно удалено {len(ids_to_delete)} устаревших документов из Qdrant.")
-        except Exception as e:
-            logger.error(f"Ошибка при удалении документов: {e}")
+        else:
             return state # В случае ошибки отменяем удаление из state
 
     for key in deleted_keys:
@@ -125,30 +143,45 @@ def run_pipeline():
         filename = str(filepath.relative_to(DATA_DIR))
         
         # Проверка идемпотентности
-        if filename in state and state[filename].get("hash") == file_hash:
+        previous_info = state.get(filename, {})
+        if (
+            filename in state
+            and previous_info.get("hash") == file_hash
+            and previous_info.get("index_schema_version") == INDEX_SCHEMA_VERSION
+            and not previous_info.get("superseded_doc_ids")
+        ):
             logger.info(f"Пропуск файла (не изменился): {filename}")
             continue
             
         logger.info(f"Обнаружен новый/измененный файл: {filename}")
-        files_to_process.append((filepath, filename, file_hash))
+        previous_doc_ids = list(previous_info.get("superseded_doc_ids", []))
+        if previous_info.get("doc_id"):
+            previous_doc_ids.append(previous_info["doc_id"])
+        files_to_process.append((filepath, filename, file_hash, previous_doc_ids))
 
     if files_to_process:
         logger.info(f"Запуск параллельного парсинга для {len(files_to_process)} файлов...")
         with concurrent.futures.ProcessPoolExecutor() as executor:
             # Маппинг futures к данным файлов
             future_to_file = {
-                executor.submit(process_file_task, str(filepath)): (filename, file_hash)
-                for filepath, filename, file_hash in files_to_process
+                executor.submit(process_file_task, str(filepath)): (
+                    filename,
+                    file_hash,
+                    previous_doc_ids,
+                )
+                for filepath, filename, file_hash, previous_doc_ids in files_to_process
             }
             
             for future in concurrent.futures.as_completed(future_to_file):
-                filename, file_hash = future_to_file[future]
+                filename, file_hash, previous_doc_ids = future_to_file[future]
                 try:
                     result = future.result()
                     if result:
                         doc_id = str(uuid.uuid4())
                         result["id"] = doc_id
-                        docs_to_index.append((filename, file_hash, doc_id, result))
+                        docs_to_index.append(
+                            (filename, file_hash, doc_id, previous_doc_ids, result)
+                        )
                     else:
                         logger.warning(f"Файл {filename} отброшен в DLQ.")
                         dlq[filename] = {"reason": "router_returned_none", "hash": file_hash}
@@ -165,18 +198,34 @@ def run_pipeline():
     logger.info(f"=== Этап 2: Векторизация ({len(docs_to_index)} новых документов) ===")
     try:
         indexer = VectorIndexer()
-        raw_docs = [item[3] for item in docs_to_index]
+        raw_docs = [item[4] for item in docs_to_index]
         
         doc_chunk_counts = indexer.build_and_save_index(raw_docs)
         
-        if doc_chunk_counts is not None:
-            for filename, file_hash, doc_id, _ in docs_to_index:
+        if doc_chunk_counts:
+            superseded_doc_ids = [
+                old_doc_id
+                for item in docs_to_index
+                for old_doc_id in item[3]
+                if old_doc_id and old_doc_id != item[2]
+            ]
+            old_chunks_deleted = delete_qdrant_documents(superseded_doc_ids)
+            if not old_chunks_deleted:
+                logger.warning(
+                    "Новые чанки записаны, но старые версии удалить не удалось. "
+                    "Повторная индексация устранит дубликаты после восстановления Qdrant."
+                )
+
+            for filename, file_hash, doc_id, previous_doc_ids, _ in docs_to_index:
                 chunk_count = doc_chunk_counts.get(doc_id, 0)
                 updated_state[filename] = {
                     "hash": file_hash,
                     "doc_id": doc_id,
-                    "chunk_count": chunk_count
+                    "chunk_count": chunk_count,
+                    "index_schema_version": INDEX_SCHEMA_VERSION,
                 }
+                if not old_chunks_deleted and previous_doc_ids:
+                    updated_state[filename]["superseded_doc_ids"] = previous_doc_ids
             save_json(STATE_FILE, updated_state)
             logger.info("✅ Пайплайн успешно завершен!")
         else:

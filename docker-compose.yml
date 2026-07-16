@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -9,6 +7,47 @@ services:
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: omni_rag_redis
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: omni_rag_postgres
+    environment:
+      POSTGRES_DB: omni_rag
+      POSTGRES_USER: omni_rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-omni_rag_local}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/001-memory.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omni_rag -d omni_rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   rag-app-cpu:
@@ -21,7 +60,19 @@ services:
       - "8501:8501"
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:3b}
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-omni_rag_collection}
+      - QDRANT_GRAPH_COLLECTION=${QDRANT_GRAPH_COLLECTION:-omni_rag_collection}
+      - GRAPH_TRAVERSAL_ENABLED=${GRAPH_TRAVERSAL_ENABLED:-true}
+      - GRAPH_TRAVERSAL_DEPTH=${GRAPH_TRAVERSAL_DEPTH:-1}
+      - GRAPH_TRAVERSAL_MAX_NODES=${GRAPH_TRAVERSAL_MAX_NODES:-6}
+      - INDEX_SCHEMA_VERSION=${INDEX_SCHEMA_VERSION:-2}
+      - MEMORY_ENABLED=${MEMORY_ENABLED:-true}
+      - SESSION_MEMORY_TTL_SECONDS=${SESSION_MEMORY_TTL_SECONDS:-1800}
+      - DEFAULT_USER_ID=${DEFAULT_USER_ID:-local-user}
+      - REDIS_URL=redis://redis:6379/0
+      - POSTGRES_DSN=postgresql://omni_rag:${POSTGRES_PASSWORD:-omni_rag_local}@postgres:5432/omni_rag
     volumes:
       - ./data:/app/data
       - ./db:/app/db
@@ -29,7 +80,12 @@ services:
       - hf_cache:/root/.cache/huggingface
       - fastembed_cache:/root/.cache/fastembed
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     profiles:
       - cpu
@@ -44,7 +100,19 @@ services:
       - "8501:8501"
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:3b}
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-omni_rag_collection}
+      - QDRANT_GRAPH_COLLECTION=${QDRANT_GRAPH_COLLECTION:-omni_rag_collection}
+      - GRAPH_TRAVERSAL_ENABLED=${GRAPH_TRAVERSAL_ENABLED:-true}
+      - GRAPH_TRAVERSAL_DEPTH=${GRAPH_TRAVERSAL_DEPTH:-1}
+      - GRAPH_TRAVERSAL_MAX_NODES=${GRAPH_TRAVERSAL_MAX_NODES:-6}
+      - INDEX_SCHEMA_VERSION=${INDEX_SCHEMA_VERSION:-2}
+      - MEMORY_ENABLED=${MEMORY_ENABLED:-true}
+      - SESSION_MEMORY_TTL_SECONDS=${SESSION_MEMORY_TTL_SECONDS:-1800}
+      - DEFAULT_USER_ID=${DEFAULT_USER_ID:-local-user}
+      - REDIS_URL=redis://redis:6379/0
+      - POSTGRES_DSN=postgresql://omni_rag:${POSTGRES_PASSWORD:-omni_rag_local}@postgres:5432/omni_rag
     volumes:
       - ./data:/app/data
       - ./db:/app/db
@@ -52,7 +120,12 @@ services:
       - hf_cache:/root/.cache/huggingface
       - fastembed_cache:/root/.cache/fastembed
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     deploy:
       resources:
@@ -66,5 +139,6 @@ services:
 
 volumes:
   qdrant_data:
+  postgres_data:
   hf_cache:
   fastembed_cache:
